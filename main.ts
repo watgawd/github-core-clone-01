@@ -15,6 +15,7 @@
 //      reads.
 //
 // main.ts imports its own server and nothing else: no package, no Node built-in, no model call.
+// This file is the process lifecycle only; every forge behaviour (git, REST, GraphQL, MCP) lives in app.ts.
 
 import { createApp } from './app.ts';
 
