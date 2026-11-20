@@ -803,8 +803,8 @@ function computeChangedFiles(repo: Repo, pull: Pull): void {
 }
 function prMergeable(repo: Repo, pull: Pull): 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN' {
   if (pull.state !== 'open') return pull.merged ? 'MERGEABLE' : 'UNKNOWN';
-  const head = resolveCommit(repo, pull.headSha);
-  const base = resolveCommit(repo, pull.baseSha);
+  const head = resolveCommit(repo, liveRefTip(repo, pull.headRef, pull.headSha));
+  const base = resolveCommit(repo, liveRefTip(repo, pull.baseRef, pull.baseSha));
   if (!head || !base) return 'UNKNOWN';
   const mb = mergeBase(repo, head, base);
   if (!mb) return 'UNKNOWN';
@@ -813,9 +813,17 @@ function prMergeable(repo: Repo, pull: Pull): 'MERGEABLE' | 'CONFLICTING' | 'UNK
   const merged = threeWayMerge(flattenTree(repo, mbC.tree), flattenTree(repo, baseC.tree), flattenTree(repo, headC.tree));
   return merged === null ? 'CONFLICTING' : 'MERGEABLE';
 }
+function liveRefTip(repo: Repo, ref: string, fallback: string): string {
+  const tip = repo.refs.get(`refs/heads/${ref}`) ?? repo.refs.get(ref);
+  if (tip) return tip;
+  return fallback;
+}
 function doSquashMerge(repo: Repo, pull: Pull): { ok: boolean; sha?: string; reason?: string } {
-  const head = resolveCommit(repo, pull.headSha);
-  const base = resolveCommit(repo, pull.baseSha);
+  // Merge against the CURRENT tips of the head and base branches, not the
+  // SHAs recorded when the PR was created — the base may have advanced since
+  // (e.g. another PR was merged first, which must then conflict).
+  const head = resolveCommit(repo, liveRefTip(repo, pull.headRef, pull.headSha));
+  const base = resolveCommit(repo, liveRefTip(repo, pull.baseRef, pull.baseSha));
   if (!head || !base) return { ok: false, reason: 'head or base commit not found' };
   const mb = mergeBase(repo, head, base);
   if (!mb) return { ok: false, reason: 'no merge base' };
@@ -1003,7 +1011,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse): Promise<bo
         for (const oid of ordered) {
           const c = commitOf(repo, oid);
           if (!c) continue;
-          list.push({ sha: oid, node_id: gid('Commit', oid), commit: { message: c.message, author: { name: VIEWER_NAME, email: VIEWER_EMAIL, date: isoOf(repo.createdTs) }, committer: { name: VIEWER_NAME, email: VIEWER_EMAIL, date: isoOf(repo.createdTs) } }, author: { login: VIEWER_LOGIN, id: VIEWER_ID, type: 'User' }, committer: { login: VIEWER_LOGIN, id: VIEWER_ID, type: 'User' }, parents: c.parents.map((p) => ({ sha: p })) });
+          list.push({ sha: oid, node_id: gid('Commit', oid), commit: { message: c.message.replace(/\n+$/, ''), author: { name: VIEWER_NAME, email: VIEWER_EMAIL, date: isoOf(repo.createdTs) }, committer: { name: VIEWER_NAME, email: VIEWER_EMAIL, date: isoOf(repo.createdTs) } }, author: { login: VIEWER_LOGIN, id: VIEWER_ID, type: 'User' }, committer: { login: VIEWER_LOGIN, id: VIEWER_ID, type: 'User' }, parents: c.parents.map((p) => ({ sha: p })) });
         }
       }
       sendJson(res, 200, list); return true;
@@ -1355,8 +1363,32 @@ function lsRefsResponse(repo: Repo, args: { peel: boolean; symrefs: boolean; pre
 }
 interface FetchPlan { objects: Map<string, GitObject>; shallow: string[]; unshallow: string[] }
 function planFetch(repo: Repo, wants: string[], haves: string[], depth: number | null, shallowIn: string[]): FetchPlan {
+  // What the client already has. A have that is also a shallow boundary only
+  // contributes itself plus its tree closure — its ancestors are NOT held
+  // (that is what "shallow" means); treating them as held breaks deepen.
+  const shallowSet = new Set(shallowIn);
   const haveClosure = new Set<string>();
-  for (const h of haves) for (const o of reachable(repo, [h])) haveClosure.add(o);
+  for (const h of haves) {
+    if (shallowSet.has(h)) {
+      const c = commitOf(repo, h);
+      if (c) {
+        haveClosure.add(h);
+        const stack = [c.tree];
+        while (stack.length > 0) {
+          const cur = stack.pop() as string;
+          if (haveClosure.has(cur)) continue;
+          const o = repo.objects.get(cur);
+          if (!o) continue;
+          haveClosure.add(cur);
+          if (o.type === 'tree') for (const e of parseTree(o.data)) stack.push(e.oid);
+        }
+      } else {
+        for (const o of reachable(repo, [h])) haveClosure.add(o);
+      }
+    } else {
+      for (const o of reachable(repo, [h])) haveClosure.add(o);
+    }
+  }
   const objects = new Map<string, GitObject>();
   const shallow: string[] = [];
   const unshallow: string[] = [];
